@@ -22,6 +22,18 @@ Open http://127.0.0.1:8000
 - `HOST` - bind address (default `127.0.0.1`)
 - `DB_PATH` - SQLite file path (default `./events.db`)
 
+## Tests
+```
+python3 -m unittest discover -s tests -v    # 8 end-to-end tests, stdlib only
+```
+
+## Validation rules (enforced server-side)
+- Title/location required, at most 120 characters; description at most 2000; attendee name at most 100.
+- `date_time` must be a real date-time (`YYYY-MM-DDTHH:MM`, seconds optional); it is stored normalised.
+- `capacity` must be a whole number from 1 to 100000.
+- Email must be a syntactically valid address (max 254). Emails are private: the API never returns them.
+- Request bodies larger than 64 KB are rejected (413).
+
 ## API
 - `GET/POST /api/events`, `GET/PUT/DELETE /api/events/{id}`
 - `POST /api/events/{id}/rsvps` with `{name, email, status: "yes"|"no"}`

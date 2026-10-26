@@ -1,5 +1,6 @@
 """Event RSVP app: Python 3 standard library only (http.server + sqlite3)."""
 import json, os, re, sqlite3, threading
+from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
@@ -8,7 +9,12 @@ DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE, "events.db"))
 PORT = int(os.environ.get("PORT", "8000"))
 HOST = os.environ.get("HOST", "127.0.0.1")
 LOCK = threading.Lock()
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# --- limits and strict validation (added after reviewing the generated code; see writeup.md) ---
+MAX_BODY = 64 * 1024
+LIMITS = {"title": 120, "location": 120, "description": 2000, "name": 100, "email": 254}
+MAX_CAPACITY = 100_000
+_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+EMAIL_RE = re.compile(rf"^[A-Za-z0-9!#$%&'*+/=?^_`{{|}}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{{|}}~-]+)*@(?:{_LABEL}\.)+[A-Za-z]{{2,}}$")
 
 
 def db():
@@ -39,21 +45,44 @@ class ApiError(Exception):
         self.code, self.msg, self.fields = code, msg, fields or {}
 
 
+def parse_capacity(v):
+    """Whole number 1..MAX_CAPACITY; accepts ints and digit strings (form posts), rejects bools/floats."""
+    if isinstance(v, bool) or isinstance(v, float):
+        return None
+    if isinstance(v, str) and re.fullmatch(r"\d{1,9}", v.strip()):
+        v = int(v.strip())
+    if isinstance(v, int) and 1 <= v <= MAX_CAPACITY:
+        return v
+    return None
+
+
+def parse_date_time(v):
+    """Real calendar date-time (YYYY-MM-DDTHH:MM[:SS]); stored normalised to YYYY-MM-DDTHH:MM."""
+    v = str(v).strip().replace(" ", "T", 1)
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?", v):
+        return None
+    try:
+        return datetime.fromisoformat(v).strftime("%Y-%m-%dT%H:%M")
+    except ValueError:
+        return None
+
+
 def clean_event(d):
     errs = {}
     title = str(d.get("title", "")).strip()
     loc = str(d.get("location", "")).strip()
-    dt = str(d.get("date_time", "")).strip()
     desc = str(d.get("description", "")).strip()
     if not title: errs["title"] = "Title is required."
+    elif len(title) > LIMITS["title"]: errs["title"] = f"Title must be at most {LIMITS['title']} characters."
     if not loc: errs["location"] = "Location is required."
-    if not dt: errs["date_time"] = "Date and time are required."
-    try:
-        cap = int(d.get("capacity"))
-        if cap < 1: raise ValueError
-    except (TypeError, ValueError):
-        cap = None
-        errs["capacity"] = "Capacity must be a whole number of at least 1."
+    elif len(loc) > LIMITS["location"]: errs["location"] = f"Location must be at most {LIMITS['location']} characters."
+    if len(desc) > LIMITS["description"]: errs["description"] = f"Description must be at most {LIMITS['description']} characters."
+    raw_dt = str(d.get("date_time", "")).strip()
+    dt = parse_date_time(raw_dt) if raw_dt else None
+    if not raw_dt: errs["date_time"] = "Date and time are required."
+    elif dt is None: errs["date_time"] = "Enter a valid date and time (YYYY-MM-DDTHH:MM)."
+    cap = parse_capacity(d.get("capacity"))
+    if cap is None: errs["capacity"] = f"Capacity must be a whole number from 1 to {MAX_CAPACITY}."
     if errs: raise ApiError(400, "Please fix the highlighted fields.", errs)
     return title, desc, dt, loc, cap
 
@@ -87,7 +116,12 @@ class H(BaseHTTPRequestHandler):
         try:
             if path.startswith("/api/"):
                 body = {}
-                n = int(self.headers.get("Content-Length") or 0)
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    raise ApiError(400, "Invalid Content-Length.")
+                if n < 0: raise ApiError(400, "Invalid Content-Length.")
+                if n > MAX_BODY: raise ApiError(413, "Request body too large.")
                 if n:
                     try: body = json.loads(self.rfile.read(n))
                     except ValueError: raise ApiError(400, "Invalid JSON.")
@@ -118,7 +152,7 @@ class H(BaseHTTPRequestHandler):
             if len(p) == 2:
                 if m == "GET":
                     ev = event_json(c, row)
-                    ev["rsvps"] = [dict(r) for r in c.execute("SELECT id,name,email,status FROM rsvps WHERE event_id=? ORDER BY id", (eid,))]
+                    ev["rsvps"] = [dict(r) for r in c.execute("SELECT id,name,status FROM rsvps WHERE event_id=? ORDER BY id", (eid,))]  # emails are private
                     return 200, ev
                 if m == "PUT":
                     t = clean_event(body)
@@ -133,8 +167,9 @@ class H(BaseHTTPRequestHandler):
                 email = str(body.get("email", "")).strip().lower()
                 status = body.get("status")
                 if not name: errs["name"] = "Name is required."
+                elif len(name) > LIMITS["name"]: errs["name"] = f"Name must be at most {LIMITS['name']} characters."
                 if not email: errs["email"] = "Email is required."
-                elif not EMAIL_RE.match(email): errs["email"] = "Please enter a valid email address."
+                elif len(email) > LIMITS["email"] or not EMAIL_RE.match(email): errs["email"] = "Please enter a valid email address."
                 if status not in ("yes", "no"): errs["status"] = "Choose yes or no."
                 if errs: raise ApiError(400, "Please fix the highlighted fields.", errs)
                 prev = c.execute("SELECT * FROM rsvps WHERE event_id=? AND email=?", (eid, email)).fetchone()
